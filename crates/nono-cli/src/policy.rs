@@ -7,6 +7,8 @@ use crate::profile;
 use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
@@ -244,6 +246,15 @@ fn escape_seatbelt_path(path: &str) -> Result<String> {
     Ok(result)
 }
 
+/// Check if a path is a character device (e.g. /dev/urandom, /dev/null).
+///
+/// `is_file()` returns false for character devices, but Landlock can apply
+/// PathBeneath rules to them via their file descriptor.
+fn is_char_device(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|m| m.file_type().is_char_device())
+}
+
 // ============================================================================
 // Group resolution
 // ============================================================================
@@ -423,9 +434,22 @@ fn add_fs_capability(
                 debug!("Could not add group file {}: {}", path_str, e);
             }
         }
+    } else if is_char_device(&path) {
+        // Character devices (e.g. /dev/urandom, /dev/null). `is_file()`
+        // returns false for these, but Landlock can apply PathBeneath
+        // rules to them via their file descriptor.
+        match FsCapability::new_file(&path, mode) {
+            Ok(mut cap) => {
+                cap.source = source.clone();
+                caps.add_fs(cap);
+            }
+            Err(e) => {
+                debug!("Could not add group character device '{}': {}", path_str, e);
+            }
+        }
     } else {
-        debug!(
-            "Group path '{}' is neither file nor directory, skipping",
+        warn!(
+            "Group path '{}' exists but has unrecognized file type — skipping",
             path_str
         );
     }
@@ -1311,6 +1335,188 @@ mod tests {
         assert!(
             result.is_ok(),
             "Unknown groups should not trigger required check"
+        );
+    }
+
+    #[test]
+    fn test_device_files_not_dropped_from_groups() {
+        // /dev/urandom is a character device, not a regular file.
+        // is_file() returns false for it, which previously caused
+        // add_fs_capability() to silently skip it.
+        let json = r#"{
+            "meta": { "version": 2, "schema_version": "2.0" },
+            "groups": {
+                "test_devices": {
+                    "description": "Group with device files",
+                    "allow": { "read": ["/dev/urandom", "/dev/null", "/tmp"] }
+                }
+            }
+        }"#;
+        let policy = load_policy(json).expect("parse failed");
+        let mut caps = CapabilitySet::new();
+        resolve_groups(&policy, &["test_devices".to_string()], &mut caps).expect("resolve failed");
+
+        let paths: Vec<String> = caps
+            .fs_capabilities()
+            .iter()
+            .map(|c| c.resolved.display().to_string())
+            .collect();
+
+        assert!(
+            paths.contains(&"/dev/urandom".to_string()),
+            "Device file /dev/urandom must not be dropped. Got: {:?}",
+            paths
+        );
+        assert!(
+            paths.contains(&"/dev/null".to_string()),
+            "Device file /dev/null must not be dropped. Got: {:?}",
+            paths
+        );
+    }
+
+    /// Expected Linux file type for paths in policy groups.
+    ///
+    /// When adding a /dev/* path to policy.json, register it here with its
+    /// Linux file type. If the type isn't handled by `add_fs_capability()`,
+    /// the test below will fail — even when CI runs on macOS.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[allow(dead_code)]
+    enum LinuxPathType {
+        Directory,
+        CharDevice,
+        BlockDevice,
+        /// Symlink resolved by canonicalize() in FsCapability (e.g. /dev/stdin -> /proc/self/fd/0)
+        Symlink,
+        Socket,
+    }
+
+    /// Well-known Linux device paths and their file types.
+    ///
+    /// Verified on Fedora 43 (kernel 6.18). These types are stable across
+    /// Linux distributions — they're defined by the kernel, not the distro.
+    ///
+    /// **Maintainers**: when adding a /dev/* path to policy.json, add it here.
+    /// If the type you need isn't in the handled set below, the test will tell
+    /// you to update add_fs_capability() and is_char_device() first.
+    fn linux_dev_path_types() -> HashMap<&'static str, LinuxPathType> {
+        use LinuxPathType::*;
+        HashMap::from([
+            // Currently in policy.json
+            ("/dev/null", CharDevice),
+            ("/dev/zero", CharDevice),
+            ("/dev/random", CharDevice),
+            ("/dev/urandom", CharDevice),
+            ("/dev/full", CharDevice),
+            ("/dev/tty", CharDevice),
+            ("/dev/console", CharDevice),
+            ("/dev/stdin", Symlink),
+            ("/dev/stdout", Symlink),
+            ("/dev/stderr", Symlink),
+            ("/dev/fd", Symlink),
+            ("/dev/pts", Directory),
+            // Not in policy, but well-known — here so that if a developer
+            // adds one, the test tells them the type isn't handled yet
+            // rather than just "please register this".
+            ("/dev/sda", BlockDevice),
+            ("/dev/sdb", BlockDevice),
+            ("/dev/vda", BlockDevice),
+            ("/dev/loop0", BlockDevice),
+            ("/dev/ptmx", CharDevice),
+            ("/dev/fuse", CharDevice),
+            ("/dev/kmsg", CharDevice),
+            ("/dev/net/tun", CharDevice),
+            ("/dev/mapper/control", CharDevice),
+            ("/dev/log", Symlink),
+            ("/dev/shm", Directory),
+            ("/dev/mqueue", Directory),
+            ("/dev/hugepages", Directory),
+        ])
+    }
+
+    #[test]
+    fn test_all_linux_dev_paths_have_known_types() {
+        // Invariant: every /dev/* path in Linux-applicable policy groups must
+        // be registered in linux_dev_path_types() with a type that
+        // add_fs_capability() handles.
+        //
+        // Currently handled: Directory (is_dir), CharDevice (is_char_device),
+        // Symlink (canonicalize resolves before type check).
+        //
+        // NOT handled: BlockDevice, Socket. If a developer adds e.g.
+        // /dev/sda to the policy, the test fails saying "BlockDevice is
+        // not handled — update is_char_device()".
+        //
+        // Pure data validation — no filesystem probing, runs on all platforms.
+        let policy = load_embedded_policy().expect("embedded policy must load");
+        let registry = linux_dev_path_types();
+
+        let is_linux_applicable =
+            |g: &Group| g.platform.is_none() || g.platform.as_deref() == Some("linux");
+
+        let mut unregistered = Vec::new();
+        let mut unhandled = Vec::new();
+
+        for (group_name, group) in &policy.groups {
+            if !is_linux_applicable(group) {
+                continue;
+            }
+            let Some(allow) = &group.allow else {
+                continue;
+            };
+
+            for path_str in allow
+                .read
+                .iter()
+                .chain(&allow.write)
+                .chain(&allow.readwrite)
+            {
+                if !path_str.starts_with("/dev/") {
+                    continue;
+                }
+
+                match registry.get(path_str.as_str()) {
+                    None => {
+                        unregistered.push(format!("'{}' in group '{}'", path_str, group_name));
+                    }
+                    Some(path_type) => {
+                        // Directory: handled by is_dir()
+                        // Symlink: resolved by canonicalize() before type check
+                        // CharDevice: handled by is_char_device()
+                        //
+                        // BlockDevice, Socket: NOT handled. If someone adds
+                        // e.g. /dev/sda to the policy, this fails and tells
+                        // them to update add_fs_capability() first.
+                        let handled = matches!(
+                            path_type,
+                            LinuxPathType::Directory
+                                | LinuxPathType::CharDevice
+                                | LinuxPathType::Symlink
+                        );
+                        if !handled {
+                            unhandled.push(format!(
+                                "'{}' in group '{}' is {:?} on Linux — \
+                                 add_fs_capability() does not handle this type yet. \
+                                 Update is_char_device() or add a new branch.",
+                                path_str, group_name, path_type
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            unregistered.is_empty(),
+            "Device paths in policy.json not registered in linux_dev_path_types():\n  {}\n\
+             Add each path with its Linux file type (CharDevice, Directory, Symlink, etc.)",
+            unregistered.join("\n  ")
+        );
+
+        assert!(
+            unhandled.is_empty(),
+            "Device paths with types not handled by add_fs_capability():\n  {}\n\
+             Update is_char_device() to support these types.",
+            unhandled.join("\n  ")
         );
     }
 
